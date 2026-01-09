@@ -59,8 +59,13 @@ def fetch_jobs() -> List[Tuple[str, str]]:
         if not JOB_URL_RE.match(full):
             continue
 
-        title = " ".join(a.get_text(" ", strip=True).split()) or "New SWE posting"
+        title = " ".join(a.get_text(" ", strip=True).split())
+        if not title:
+            # This is usually the image-only link; skip it
+            continue
+        
         jobs.append((full, title))
+
 
     # Deduplicate
     seen_links = set()
