@@ -7,15 +7,20 @@ from typing import List, Tuple, Optional
 import requests
 from bs4 import BeautifulSoup
 
-# ---------- Intern-List ----------
+# =========================
+# Intern-List (SWE list page)
+# =========================
 INTERNLIST_URL = "https://www.intern-list.com/swe-intern-list"
 INTERNLIST_JOB_URL_RE = re.compile(r"^https://www\.intern-list\.com/swe-intern-list/.+_\d+$")
 
-# ---------- SimplifyJobs GitHub Repo ----------
-# Raw README (dev branch). This is the main list repo page: https://github.com/SimplifyJobs/Summer2026-Internships
-SIMPLIFY_RAW_README_URL = "https://raw.githubusercontent.com/SimplifyJobs/Summer2026-Internships/dev/README.md"
-# We only parse the "Software Engineering Internship Roles" section in the README.
-SIMPLIFY_SECTION_HEADER_RE = re.compile(r"^##\s+Software Engineering Internship Roles\s*$", re.MULTILINE)
+# =========================
+# SimplifyJobs GitHub repo
+# =========================
+SIMPLIFY_RAW_URLS = [
+    "https://raw.githubusercontent.com/SimplifyJobs/Summer2026-Internships/dev/README.md",
+    "https://raw.githubusercontent.com/SimplifyJobs/Summer2026-Internships/main/README.md",
+]
+SWE_SECTION_RE = re.compile(r"^##\s+Software Engineering Internship Roles\s*$", re.MULTILINE)
 
 STATE_FILE = "seen.json"
 
@@ -39,10 +44,15 @@ def save_seen(seen: set[str]) -> None:
 def send_telegram(msg: str) -> None:
     token = os.environ["TELEGRAM_BOT_TOKEN"]
     chat_id = os.environ["TELEGRAM_CHAT_ID"]
+
     api = f"https://api.telegram.org/bot{token}/sendMessage"
     r = requests.post(
         api,
-        data={"chat_id": chat_id, "text": msg, "disable_web_page_preview": True},
+        data={
+            "chat_id": chat_id,
+            "text": msg,
+            "disable_web_page_preview": True,
+        },
         timeout=25,
     )
     r.raise_for_status()
@@ -50,8 +60,12 @@ def send_telegram(msg: str) -> None:
 
 def git_commit_if_changed() -> None:
     diff = subprocess.run(
-        ["git", "diff", "--name-only"], check=True, capture_output=True, text=True
+        ["git", "diff", "--name-only"],
+        check=True,
+        capture_output=True,
+        text=True,
     ).stdout.strip()
+
     if "seen.json" not in diff:
         return
 
@@ -65,7 +79,7 @@ def git_commit_if_changed() -> None:
     subprocess.run(["git", "push"], check=True)
 
 
-def normalize_url(href: str) -> Optional[str]:
+def normalize_internlist_url(href: str) -> Optional[str]:
     href = (href or "").strip()
     if not href:
         return None
@@ -76,7 +90,9 @@ def normalize_url(href: str) -> Optional[str]:
     return None
 
 
-# -------------------- Intern-List scraper --------------------
+# ----------------------------
+# Intern-List scraper
+# ----------------------------
 def fetch_internlist_jobs() -> List[Tuple[str, str, str]]:
     """
     Returns list of (job_id, title, link)
@@ -93,7 +109,7 @@ def fetch_internlist_jobs() -> List[Tuple[str, str, str]]:
     seen_links = set()
 
     for a in soup.select("a[href]"):
-        link = normalize_url(a.get("href"))
+        link = normalize_internlist_url(a.get("href"))
         if not link:
             continue
         if not INTERNLIST_JOB_URL_RE.match(link):
@@ -122,74 +138,77 @@ def fetch_internlist_jobs() -> List[Tuple[str, str, str]]:
     return out
 
 
-# -------------------- SimplifyJobs GitHub scraper --------------------
-def _extract_markdown_link(cell: str) -> Optional[str]:
-    # Matches [text](url)
+# ----------------------------
+# Simplify scraper (robust)
+# ----------------------------
+def _first_md_link_url(cell: str) -> Optional[str]:
     m = re.search(r"\[[^\]]+\]\((https?://[^)]+)\)", cell)
     return m.group(1) if m else None
 
 
 def fetch_simplify_swe_jobs() -> List[Tuple[str, str, str]]:
     """
-    Parses the SimplifyJobs/Summer2026-Internships README.md (dev branch),
-    extracts the Software Engineering table rows, returns (job_id, title, link).
-
-    We use the application link as the primary link when available.
+    Returns list of (job_id, title, link) from SimplifyJobs/Summer2026-Internships SWE table.
     """
-    md = requests.get(
-        SIMPLIFY_RAW_README_URL,
-        timeout=25,
-        headers={"User-Agent": "Mozilla/5.0 (internlist-alert-bot)"},
-    ).text
+    md = None
+    used_url = None
 
-    # Find the SWE section
-    m = SIMPLIFY_SECTION_HEADER_RE.search(md)
+    for url in SIMPLIFY_RAW_URLS:
+        try:
+            r = requests.get(url, timeout=35, headers={"User-Agent": "Mozilla/5.0"})
+            if r.status_code == 200 and r.text and "Summer 2026" in r.text:
+                md = r.text
+                used_url = url
+                break
+        except Exception:
+            continue
+
+    if not md:
+        return []
+
+    m = SWE_SECTION_RE.search(md)
     if not m:
         return []
 
-    # Take text from SWE header until the next "## " header
     start = m.end()
-    next_header = re.search(r"\n##\s+", md[start:])
-    section = md[start : start + next_header.start()] if next_header else md[start:]
+    m2 = re.search(r"\n##\s+", md[start:])
+    section = md[start : start + m2.start()] if m2 else md[start:]
 
-    # Extract markdown table rows (pipes)
-    # Typical table: | Company | Role | Location | Application | Age |
-    lines = [ln.strip() for ln in section.splitlines() if ln.strip().startswith("|")]
+    # Pipe table rows
+    lines = [ln.rstrip() for ln in section.splitlines() if ln.strip().startswith("|")]
+    if not lines:
+        return []
 
     jobs: List[Tuple[str, str, str]] = []
-    seen_ids = set()
 
     for ln in lines:
-        # skip header + separator rows
-        if re.match(r"^\|\s*Company\s*\|", ln, re.IGNORECASE):
+        # Skip header row and separator row
+        if re.match(r"^\|\s*Company\s*\|", ln, flags=re.IGNORECASE):
             continue
-        if set(ln.replace("|", "").strip()) <= {"-", ":", " "}:
-            continue
-
-        cells = [c.strip() for c in ln.strip("|").split("|")]
-        if len(cells) < 4:
+        if re.match(r"^\|\s*[-: ]+\|\s*[-: ]+\|", ln):
             continue
 
-        company = cells[0]
-        role = cells[1]
-        location = cells[2]
+        cells = [c.strip() for c in ln.strip().strip("|").split("|")]
+        if len(cells) < 5:
+            continue
+
+        company = re.sub(r"\s+", " ", re.sub(r"\[|\]|\(.*?\)", "", cells[0])).strip()
+        role = re.sub(r"\s+", " ", re.sub(r"\[|\]|\(.*?\)", "", cells[1])).strip()
+        location = re.sub(r"\s+", " ", cells[2]).strip()
         app_cell = cells[3]
+        age = cells[4].strip()
 
-        link = _extract_markdown_link(app_cell)
+        link = _first_md_link_url(app_cell)
         if not link:
-            # Some rows might have empty app cells; skip those.
             continue
 
-        title = f"[Simplify] {company} — {role} ({location})"
+        title = f"[Simplify | {age}] {company} — {role} ({location})"
         job_id = f"simplify:{company}|{role}|{location}|{link}"
-
-        if job_id in seen_ids:
-            continue
-        seen_ids.add(job_id)
 
         jobs.append((job_id, title, link))
 
     return jobs
+
 
 def main():
     seen = load_seen()
@@ -197,18 +216,10 @@ def main():
     internlist_jobs = fetch_internlist_jobs()
     simplify_jobs = fetch_simplify_swe_jobs()
 
-    new_internlist = [
-        (jid, title, link)
-        for (jid, title, link) in internlist_jobs
-        if jid not in seen
-    ]
+    new_internlist = [(jid, title, link) for (jid, title, link) in internlist_jobs if jid not in seen]
+    new_simplify = [(jid, title, link) for (jid, title, link) in simplify_jobs if jid not in seen]
 
-    new_simplify = [
-        (jid, title, link)
-        for (jid, title, link) in simplify_jobs
-        if jid not in seen
-    ]
-
+    # If nothing new, do nothing (avoid spam)
     if not new_internlist and not new_simplify:
         return
 
@@ -216,23 +227,25 @@ def main():
 
     if new_internlist:
         lines.append("📌 Intern-List")
-        for jid, title, link in new_internlist[:6]:
+        for _, title, link in new_internlist[:6]:
             lines.append(f"- {title}\n  {link}\n")
 
+    # Always show Simplify section so you can tell if it's broken/empty
+    lines.append("📌 Simplify (GitHub)")
     if new_simplify:
-        lines.append("📌 Simplify (GitHub)")
-        for jid, title, link in new_simplify[:6]:
+        for _, title, link in new_simplify[:6]:
             lines.append(f"- {title}\n  {link}\n")
+    else:
+        lines.append("- (No new postings found from Simplify on this run)\n")
 
     send_telegram("\n".join(lines))
 
-    # mark everything as seen
-    for jid, _, _ in new_internlist + new_simplify:
+    # Mark all new items as seen
+    for jid, _, _ in (new_internlist + new_simplify):
         seen.add(jid)
 
     save_seen(seen)
     git_commit_if_changed()
-
 
 
 if __name__ == "__main__":
