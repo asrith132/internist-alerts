@@ -191,33 +191,48 @@ def fetch_simplify_swe_jobs() -> List[Tuple[str, str, str]]:
 
     return jobs
 
-
 def main():
     seen = load_seen()
 
-    jobs = []
-    jobs.extend(fetch_internlist_jobs())
-    jobs.extend(fetch_simplify_swe_jobs())
+    internlist_jobs = fetch_internlist_jobs()
+    simplify_jobs = fetch_simplify_swe_jobs()
 
-    new_jobs = [(jid, title, link) for (jid, title, link) in jobs if jid not in seen]
-    if not new_jobs:
+    new_internlist = [
+        (jid, title, link)
+        for (jid, title, link) in internlist_jobs
+        if jid not in seen
+    ]
+
+    new_simplify = [
+        (jid, title, link)
+        for (jid, title, link) in simplify_jobs
+        if jid not in seen
+    ]
+
+    if not new_internlist and not new_simplify:
         return
 
-    lines = ["🆕 New internship postings (Intern-List + Simplify):"]
+    lines = ["🆕 New Internship Postings\n"]
 
-    # send up to 8 per run
-    for jid, title, link in new_jobs[:8]:
-        # one blank line after each posting
-        lines.append(f"- {title}\n  {link}\n")
+    if new_internlist:
+        lines.append("📌 Intern-List")
+        for jid, title, link in new_internlist[:6]:
+            lines.append(f"- {title}\n  {link}\n")
+
+    if new_simplify:
+        lines.append("📌 Simplify (GitHub)")
+        for jid, title, link in new_simplify[:6]:
+            lines.append(f"- {title}\n  {link}\n")
 
     send_telegram("\n".join(lines))
 
-    # mark all as seen (not only first 8)
-    for jid, _, _ in new_jobs:
+    # mark everything as seen
+    for jid, _, _ in new_internlist + new_simplify:
         seen.add(jid)
 
     save_seen(seen)
     git_commit_if_changed()
+
 
 
 if __name__ == "__main__":
