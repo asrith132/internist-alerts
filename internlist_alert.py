@@ -14,13 +14,12 @@ INTERNLIST_URL = "https://www.intern-list.com/swe-intern-list"
 INTERNLIST_JOB_URL_RE = re.compile(r"^https://www\.intern-list\.com/swe-intern-list/.+_\d+$")
 
 # =========================
-# SimplifyJobs GitHub repo
+# SimplifyJobs GitHub repo (raw README)
 # =========================
 SIMPLIFY_RAW_URLS = [
     "https://raw.githubusercontent.com/SimplifyJobs/Summer2026-Internships/dev/README.md",
     "https://raw.githubusercontent.com/SimplifyJobs/Summer2026-Internships/main/README.md",
 ]
-SWE_SECTION_RE = re.compile(r"^##\s+Software Engineering Internship Roles\s*$", re.MULTILINE)
 
 STATE_FILE = "seen.json"
 
@@ -53,7 +52,7 @@ def send_telegram(msg: str) -> None:
             "text": msg,
             "disable_web_page_preview": True,
         },
-        timeout=25,
+        timeout=30,
     )
     r.raise_for_status()
 
@@ -96,11 +95,10 @@ def normalize_internlist_url(href: str) -> Optional[str]:
 def fetch_internlist_jobs() -> List[Tuple[str, str, str]]:
     """
     Returns list of (job_id, title, link)
-    job_id is prefixed with 'internlist:' to avoid collisions.
     """
     html = requests.get(
         INTERNLIST_URL,
-        timeout=25,
+        timeout=30,
         headers={"User-Agent": "Mozilla/5.0 (internlist-alert-bot)"},
     ).text
     soup = BeautifulSoup(html, "html.parser")
@@ -139,66 +137,115 @@ def fetch_internlist_jobs() -> List[Tuple[str, str, str]]:
 
 
 # ----------------------------
-# Simplify scraper (robust)
+# Simplify scraper (table-header based)
 # ----------------------------
-def _first_md_link_url(cell: str) -> Optional[str]:
-    m = re.search(r"\[[^\]]+\]\((https?://[^)]+)\)", cell)
-    return m.group(1) if m else None
-
-
-def fetch_simplify_swe_jobs() -> List[Tuple[str, str, str]]:
+def _extract_any_url(text: str) -> Optional[str]:
     """
-    Returns list of (job_id, title, link) from SimplifyJobs/Summer2026-Internships SWE table.
+    Pull the first URL from:
+      - markdown links: [Apply](https://...)
+      - raw urls: https://...
+      - html links: <a href="https://...">
+    """
+    if not text:
+        return None
+
+    # HTML href first
+    m = re.search(r'href="(https?://[^"]+)"', text)
+    if m:
+        return m.group(1)
+
+    # Markdown link
+    m = re.search(r"\[[^\]]+\]\((https?://[^)]+)\)", text)
+    if m:
+        return m.group(1)
+
+    # Raw URL
+    m = re.search(r"(https?://[^\s)]+)", text)
+    if m:
+        return m.group(1)
+
+    return None
+
+
+def _clean_md_text(s: str) -> str:
+    # Convert [text](url) -> text
+    s = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", s)
+    # Remove leftover HTML tags if any
+    s = re.sub(r"<[^>]+>", "", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+
+def fetch_simplify_swe_jobs() -> Tuple[List[Tuple[str, str, str]], int]:
+    """
+    Finds the SWE table by matching the table header row:
+      | Company | Role | Location | Application | Age |
+    Then parses subsequent pipe rows until the table ends.
+
+    Returns (jobs, parsed_row_count)
+    jobs: (job_id, title, link)
     """
     md = None
-    used_url = None
-
     for url in SIMPLIFY_RAW_URLS:
         try:
-            r = requests.get(url, timeout=35, headers={"User-Agent": "Mozilla/5.0"})
-            if r.status_code == 200 and r.text and "Summer 2026" in r.text:
+            r = requests.get(url, timeout=60, headers={"User-Agent": "Mozilla/5.0"})
+            if r.status_code == 200 and r.text:
                 md = r.text
-                used_url = url
                 break
         except Exception:
             continue
 
     if not md:
-        return []
+        return [], 0
 
-    m = SWE_SECTION_RE.search(md)
-    if not m:
-        return []
+    lines = md.splitlines()
 
-    start = m.end()
-    m2 = re.search(r"\n##\s+", md[start:])
-    section = md[start : start + m2.start()] if m2 else md[start:]
+    # 1) Find the table header row for SWE
+    header_idx = -1
+    for i, ln in enumerate(lines):
+        norm = re.sub(r"\s+", " ", ln.strip().lower())
+        if (
+            norm.startswith("| company |")
+            and " | role | " in norm
+            and " | location | " in norm
+            and " | application | " in norm
+            and " | age |" in norm
+        ):
+            header_idx = i
+            break
 
-    # Pipe table rows
-    lines = [ln.rstrip() for ln in section.splitlines() if ln.strip().startswith("|")]
-    if not lines:
-        return []
+    if header_idx == -1:
+        return [], 0
+
+    # 2) Table starts after header + separator row
+    start = header_idx + 2
 
     jobs: List[Tuple[str, str, str]] = []
+    parsed_rows = 0
 
-    for ln in lines:
-        # Skip header row and separator row
-        if re.match(r"^\|\s*Company\s*\|", ln, flags=re.IGNORECASE):
-            continue
-        if re.match(r"^\|\s*[-: ]+\|\s*[-: ]+\|", ln):
+    for ln in lines[start:]:
+        if not ln.strip().startswith("|"):
+            # table ended
+            break
+
+        # skip separator rows if any appear again
+        if set(ln.replace("|", "").strip()) <= {"-", ":", " "}:
             continue
 
         cells = [c.strip() for c in ln.strip().strip("|").split("|")]
         if len(cells) < 5:
             continue
 
-        company = re.sub(r"\s+", " ", re.sub(r"\[|\]|\(.*?\)", "", cells[0])).strip()
-        role = re.sub(r"\s+", " ", re.sub(r"\[|\]|\(.*?\)", "", cells[1])).strip()
-        location = re.sub(r"\s+", " ", cells[2]).strip()
-        app_cell = cells[3]
-        age = cells[4].strip()
+        parsed_rows += 1
 
-        link = _first_md_link_url(app_cell)
+        company = _clean_md_text(cells[0])
+        role = _clean_md_text(cells[1])
+        location = _clean_md_text(cells[2])
+        app_cell = cells[3]
+        age = _clean_md_text(cells[4]) or "?"
+
+        # Extract application URL
+        link = _extract_any_url(app_cell) or _extract_any_url(ln)
         if not link:
             continue
 
@@ -207,19 +254,19 @@ def fetch_simplify_swe_jobs() -> List[Tuple[str, str, str]]:
 
         jobs.append((job_id, title, link))
 
-    return jobs
+    return jobs, parsed_rows
 
 
 def main():
     seen = load_seen()
 
     internlist_jobs = fetch_internlist_jobs()
-    simplify_jobs = fetch_simplify_swe_jobs()
+    simplify_jobs, simplify_parsed_rows = fetch_simplify_swe_jobs()
 
     new_internlist = [(jid, title, link) for (jid, title, link) in internlist_jobs if jid not in seen]
     new_simplify = [(jid, title, link) for (jid, title, link) in simplify_jobs if jid not in seen]
 
-    # If nothing new, do nothing (avoid spam)
+    # Avoid spam if nothing new
     if not new_internlist and not new_simplify:
         return
 
@@ -230,8 +277,10 @@ def main():
         for _, title, link in new_internlist[:6]:
             lines.append(f"- {title}\n  {link}\n")
 
-    # Always show Simplify section so you can tell if it's broken/empty
+    # Always show Simplify section so it's obvious if it's empty/broken
     lines.append("📌 Simplify (GitHub)")
+    lines.append(f"- Parsed {simplify_parsed_rows} rows; {len(new_simplify)} new this run\n")
+
     if new_simplify:
         for _, title, link in new_simplify[:6]:
             lines.append(f"- {title}\n  {link}\n")
@@ -240,7 +289,7 @@ def main():
 
     send_telegram("\n".join(lines))
 
-    # Mark all new items as seen
+    # Mark as seen
     for jid, _, _ in (new_internlist + new_simplify):
         seen.add(jid)
 
