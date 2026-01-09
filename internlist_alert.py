@@ -14,12 +14,9 @@ INTERNLIST_URL = "https://www.intern-list.com/swe-intern-list"
 INTERNLIST_JOB_URL_RE = re.compile(r"^https://www\.intern-list\.com/swe-intern-list/.+_\d+$")
 
 # =========================
-# SimplifyJobs GitHub repo (raw README)
+# SimplifyJobs GitHub (rendered HTML)
 # =========================
-SIMPLIFY_RAW_URLS = [
-    "https://raw.githubusercontent.com/SimplifyJobs/Summer2026-Internships/dev/README.md",
-    "https://raw.githubusercontent.com/SimplifyJobs/Summer2026-Internships/main/README.md",
-]
+SIMPLIFY_REPO_PAGE_URL = "https://github.com/SimplifyJobs/Summer2026-Internships"
 
 STATE_FILE = "seen.json"
 
@@ -47,11 +44,7 @@ def send_telegram(msg: str) -> None:
     api = f"https://api.telegram.org/bot{token}/sendMessage"
     r = requests.post(
         api,
-        data={
-            "chat_id": chat_id,
-            "text": msg,
-            "disable_web_page_preview": True,
-        },
+        data={"chat_id": chat_id, "text": msg, "disable_web_page_preview": True},
         timeout=30,
     )
     r.raise_for_status()
@@ -137,115 +130,87 @@ def fetch_internlist_jobs() -> List[Tuple[str, str, str]]:
 
 
 # ----------------------------
-# Simplify scraper (table-header based)
+# Simplify (GitHub HTML) scraper
 # ----------------------------
-def _extract_any_url(text: str) -> Optional[str]:
-    """
-    Pull the first URL from:
-      - markdown links: [Apply](https://...)
-      - raw urls: https://...
-      - html links: <a href="https://...">
-    """
-    if not text:
-        return None
-
-    # HTML href first
-    m = re.search(r'href="(https?://[^"]+)"', text)
-    if m:
-        return m.group(1)
-
-    # Markdown link
-    m = re.search(r"\[[^\]]+\]\((https?://[^)]+)\)", text)
-    if m:
-        return m.group(1)
-
-    # Raw URL
-    m = re.search(r"(https?://[^\s)]+)", text)
-    if m:
-        return m.group(1)
-
-    return None
-
-
-def _clean_md_text(s: str) -> str:
-    # Convert [text](url) -> text
-    s = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", s)
-    # Remove leftover HTML tags if any
-    s = re.sub(r"<[^>]+>", "", s)
-    s = re.sub(r"\s+", " ", s).strip()
-    return s
-
-
 def fetch_simplify_swe_jobs() -> Tuple[List[Tuple[str, str, str]], int]:
     """
-    Finds the SWE table by matching the table header row:
-      | Company | Role | Location | Application | Age |
-    Then parses subsequent pipe rows until the table ends.
+    Scrapes the rendered GitHub repo page HTML, finds the
+    "Software Engineering Internship Roles" section, and parses the table.
 
     Returns (jobs, parsed_row_count)
     jobs: (job_id, title, link)
     """
-    md = None
-    for url in SIMPLIFY_RAW_URLS:
-        try:
-            r = requests.get(url, timeout=60, headers={"User-Agent": "Mozilla/5.0"})
-            if r.status_code == 200 and r.text:
-                md = r.text
-                break
-        except Exception:
-            continue
+    html = requests.get(
+        SIMPLIFY_REPO_PAGE_URL,
+        timeout=45,
+        headers={"User-Agent": "Mozilla/5.0 (internlist-alert-bot)"},
+    ).text
 
-    if not md:
-        return [], 0
+    soup = BeautifulSoup(html, "html.parser")
 
-    lines = md.splitlines()
-
-    # 1) Find the table header row for SWE
-    header_idx = -1
-    for i, ln in enumerate(lines):
-        norm = re.sub(r"\s+", " ", ln.strip().lower())
-        if (
-            norm.startswith("| company |")
-            and " | role | " in norm
-            and " | location | " in norm
-            and " | application | " in norm
-            and " | age |" in norm
-        ):
-            header_idx = i
+    # Find the header that contains the section title
+    # GitHub uses h2/h3 with id like "user-content--software-engineering-internship-roles"
+    header = None
+    for tag in soup.find_all(["h2", "h3"]):
+        text = " ".join(tag.get_text(" ", strip=True).split()).lower()
+        if "software engineering internship roles" in text:
+            header = tag
             break
 
-    if header_idx == -1:
+    if not header:
         return [], 0
 
-    # 2) Table starts after header + separator row
-    start = header_idx + 2
+    # Find the next table after the header
+    table = header.find_next("table")
+    if not table:
+        return [], 0
+
+    # Read header columns to find indexes
+    ths = [th.get_text(" ", strip=True).lower() for th in table.find_all("th")]
+    # Expected: Company, Role, Location, Application, Age
+    def col_idx(name: str) -> int:
+        for i, t in enumerate(ths):
+            if name in t:
+                return i
+        return -1
+
+    i_company = col_idx("company")
+    i_role = col_idx("role")
+    i_location = col_idx("location")
+    i_app = col_idx("application")
+    i_age = col_idx("age")
+
+    if min(i_company, i_role, i_location, i_app, i_age) < 0:
+        return [], 0
 
     jobs: List[Tuple[str, str, str]] = []
     parsed_rows = 0
 
-    for ln in lines[start:]:
-        if not ln.strip().startswith("|"):
-            # table ended
-            break
-
-        # skip separator rows if any appear again
-        if set(ln.replace("|", "").strip()) <= {"-", ":", " "}:
-            continue
-
-        cells = [c.strip() for c in ln.strip().strip("|").split("|")]
-        if len(cells) < 5:
+    for tr in table.find_all("tr"):
+        tds = tr.find_all("td")
+        if not tds:
             continue
 
         parsed_rows += 1
 
-        company = _clean_md_text(cells[0])
-        role = _clean_md_text(cells[1])
-        location = _clean_md_text(cells[2])
-        app_cell = cells[3]
-        age = _clean_md_text(cells[4]) or "?"
+        def cell_text(idx: int) -> str:
+            return " ".join(tds[idx].get_text(" ", strip=True).split())
 
-        # Extract application URL
-        link = _extract_any_url(app_cell) or _extract_any_url(ln)
+        company = cell_text(i_company)
+        role = cell_text(i_role)
+        location = cell_text(i_location)
+        age = cell_text(i_age) or "?"
+
+        # Application link: try to find first <a href=...> inside the Application cell
+        app_cell = tds[i_app]
+        a = app_cell.find("a", href=True)
+        link = a["href"].strip() if a else ""
+
+        # GitHub sometimes uses relative links; convert to absolute
+        if link.startswith("/"):
+            link = "https://github.com" + link
+
+        # If the Application cell has no link, skip (rare but possible)
         if not link:
             continue
 
@@ -277,7 +242,7 @@ def main():
         for _, title, link in new_internlist[:6]:
             lines.append(f"- {title}\n  {link}\n")
 
-    # Always show Simplify section so it's obvious if it's empty/broken
+    # Always show Simplify section so you can see if it’s working
     lines.append("📌 Simplify (GitHub)")
     lines.append(f"- Parsed {simplify_parsed_rows} rows; {len(new_simplify)} new this run\n")
 
