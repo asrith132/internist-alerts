@@ -86,9 +86,6 @@ def normalize_internlist_url(href: str) -> Optional[str]:
 # Intern-List scraper
 # ----------------------------
 def fetch_internlist_jobs() -> List[Tuple[str, str, str]]:
-    """
-    Returns list of (job_id, title, link)
-    """
     html = requests.get(
         INTERNLIST_URL,
         timeout=30,
@@ -108,8 +105,7 @@ def fetch_internlist_jobs() -> List[Tuple[str, str, str]]:
 
         raw = " ".join(a.get_text(" ", strip=True).split())
         if not raw:
-            # image-only anchors -> skip
-            continue
+            continue  # image-only anchors
 
         # Move date to the front: [January 8, 2026] ...
         date_match = re.search(r"([A-Za-z]+ \d{1,2}, \d{4})", raw)
@@ -133,13 +129,6 @@ def fetch_internlist_jobs() -> List[Tuple[str, str, str]]:
 # Simplify (GitHub HTML) scraper
 # ----------------------------
 def fetch_simplify_swe_jobs() -> Tuple[List[Tuple[str, str, str]], int]:
-    """
-    Scrapes the rendered GitHub repo page HTML, finds the
-    "Software Engineering Internship Roles" section, and parses the table.
-
-    Returns (jobs, parsed_row_count)
-    jobs: (job_id, title, link)
-    """
     html = requests.get(
         SIMPLIFY_REPO_PAGE_URL,
         timeout=45,
@@ -148,8 +137,6 @@ def fetch_simplify_swe_jobs() -> Tuple[List[Tuple[str, str, str]], int]:
 
     soup = BeautifulSoup(html, "html.parser")
 
-    # Find the header that contains the section title
-    # GitHub uses h2/h3 with id like "user-content--software-engineering-internship-roles"
     header = None
     for tag in soup.find_all(["h2", "h3"]):
         text = " ".join(tag.get_text(" ", strip=True).split()).lower()
@@ -160,14 +147,13 @@ def fetch_simplify_swe_jobs() -> Tuple[List[Tuple[str, str, str]], int]:
     if not header:
         return [], 0
 
-    # Find the next table after the header
     table = header.find_next("table")
     if not table:
         return [], 0
 
-    # Read header columns to find indexes
+    # Identify column indexes by header labels
     ths = [th.get_text(" ", strip=True).lower() for th in table.find_all("th")]
-    # Expected: Company, Role, Location, Application, Age
+
     def col_idx(name: str) -> int:
         for i, t in enumerate(ths):
             if name in t:
@@ -201,7 +187,6 @@ def fetch_simplify_swe_jobs() -> Tuple[List[Tuple[str, str, str]], int]:
         location = cell_text(i_location)
         age = cell_text(i_age) or "?"
 
-        # Application link: try to find first <a href=...> inside the Application cell
         app_cell = tds[i_app]
         a = app_cell.find("a", href=True)
         link = a["href"].strip() if a else ""
@@ -210,7 +195,6 @@ def fetch_simplify_swe_jobs() -> Tuple[List[Tuple[str, str, str]], int]:
         if link.startswith("/"):
             link = "https://github.com" + link
 
-        # If the Application cell has no link, skip (rare but possible)
         if not link:
             continue
 
@@ -222,14 +206,45 @@ def fetch_simplify_swe_jobs() -> Tuple[List[Tuple[str, str, str]], int]:
     return jobs, parsed_rows
 
 
+def is_fresh_simplify_age(age_str: str) -> bool:
+    """
+    Keep only very fresh Simplify rows: 0d or 1d.
+    Age strings are like '0d', '1d', '10d', etc.
+    """
+    age_str = (age_str or "").strip().lower()
+    return age_str in {"0d", "1d"}
+
+
 def main():
     seen = load_seen()
 
     internlist_jobs = fetch_internlist_jobs()
     simplify_jobs, simplify_parsed_rows = fetch_simplify_swe_jobs()
 
+    # ----------------------------
+    # Filter 1: "Prime silently" on first run (seen.json empty)
+    # ----------------------------
+    if not seen:
+        # Mark everything currently visible as seen and exit without messaging
+        for jid, _, _ in internlist_jobs + simplify_jobs:
+            seen.add(jid)
+        save_seen(seen)
+        git_commit_if_changed()
+        return
+
+    # Intern-List new items (no extra age filter)
     new_internlist = [(jid, title, link) for (jid, title, link) in internlist_jobs if jid not in seen]
-    new_simplify = [(jid, title, link) for (jid, title, link) in simplify_jobs if jid not in seen]
+
+    # Simplify new items + Filter 2: only 0d/1d
+    new_simplify = []
+    for jid, title, link in simplify_jobs:
+        if jid in seen:
+            continue
+        m = re.search(r"\[Simplify \|\s*([^\]]+)\]", title)
+        age = m.group(1).strip() if m else ""
+        if not is_fresh_simplify_age(age):
+            continue
+        new_simplify.append((jid, title, link))
 
     # Avoid spam if nothing new
     if not new_internlist and not new_simplify:
@@ -242,9 +257,9 @@ def main():
         for _, title, link in new_internlist[:6]:
             lines.append(f"- {title}\n  {link}\n")
 
-    # Always show Simplify section so you can see if it’s working
+    # Always show Simplify section so you can see status
     lines.append("📌 Simplify (GitHub)")
-    lines.append(f"- Parsed {simplify_parsed_rows} rows; {len(new_simplify)} new this run\n")
+    lines.append(f"- Parsed {simplify_parsed_rows} rows; {len(new_simplify)} new (age 0d/1d)\n")
 
     if new_simplify:
         for _, title, link in new_simplify[:6]:
